@@ -338,44 +338,66 @@ async function sendPushToFriends(userId, payload) {
 
 // ─── Medal Logic ──────────────────────────────────────────────────────────────
 async function tryAwardMedal(userId) {
-  const weekLabel = isoWeekLabel(new Date());
+  // Compute ISO week label (Monday = start of week)
+  const now = new Date();
+  const day = now.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
+  // Start of this ISO week (Monday)
+  const startOfWeek = new Date(now);
+  startOfWeek.setDate(now.getDate() - (day === 0 ? 6 : day - 1));
+  startOfWeek.setHours(0, 0, 0, 0);
+  const startOfWeekISO = startOfWeek.toISOString();
+
+  // ISO week label e.g. "2025-W22"
+  const weekLabel = isoWeekLabel(now);
+
+  // Get all friends
   const friendRows = await db.prepare(`
     SELECT CASE WHEN requester_id = ? THEN addressee_id ELSE requester_id END AS friend_id
     FROM friendships WHERE (requester_id = ? OR addressee_id = ?) AND status = 'accepted'
   `).all(userId, userId, userId);
-  const groupIds = [userId, ...friendRows.map(r => r.friend_id)];
+  const allUserIds = [userId, ...friendRows.map(r => r.friend_id)];
+  const placeholders = allUserIds.map(() => '?').join(',');
 
-  const placeholders = groupIds.map(() => '?').join(',');
-  let leaderSql;
+  // Count check-ins since Monday for all users in the group
+  let countSql;
   if (isPostgres) {
-    leaderSql = `
-      SELECT user_id, COUNT(*) as cnt
+    countSql = `
+      SELECT user_id, COUNT(*) as count
       FROM checkins
       WHERE user_id IN (${placeholders})
-        AND checked_in_at >= NOW() - INTERVAL '7 days'
+        AND checked_in_at >= ?
       GROUP BY user_id
-      ORDER BY cnt DESC
-      LIMIT 1
+      ORDER BY count DESC
     `;
   } else {
-    leaderSql = `
-      SELECT user_id, COUNT(*) as cnt
+    countSql = `
+      SELECT user_id, COUNT(*) as count
       FROM checkins
       WHERE user_id IN (${placeholders})
-        AND checked_in_at >= datetime('now', 'weekday 0', '-7 days')
+        AND checked_in_at >= ?
       GROUP BY user_id
-      ORDER BY cnt DESC
-      LIMIT 1
+      ORDER BY count DESC
     `;
   }
-  const leader = await db.prepare(leaderSql).get(...groupIds);
+  const counts = await db.prepare(countSql).all(...allUserIds, startOfWeekISO);
 
-  if (leader && leader.user_id === userId) {
-    const existing = await db.prepare(
+  if (counts.length === 0) return;
+
+  const maxCount = Number(counts[0].count);
+  if (maxCount === 0) return;
+
+  // Award medal to all tied winners (anyone matching the max count)
+  const winners = counts.filter(c => Number(c.count) === maxCount);
+  for (const winner of winners) {
+    const alreadyAwarded = await db.prepare(
       'SELECT id FROM medals WHERE user_id = ? AND week_label = ?'
-    ).get(userId, weekLabel);
-    if (!existing) {
-      await db.prepare('INSERT INTO medals (user_id, week_label) VALUES (?, ?)').run(userId, weekLabel);
+    ).get(winner.user_id, weekLabel);
+    if (!alreadyAwarded) {
+      if (isPostgres) {
+        await db.prepare('INSERT INTO medals (user_id, week_label) VALUES (?, ?) RETURNING id').run(winner.user_id, weekLabel);
+      } else {
+        db.prepare('INSERT INTO medals (user_id, week_label) VALUES (?, ?)').run(winner.user_id, weekLabel);
+      }
     }
   }
 }
@@ -467,14 +489,12 @@ friendsRouter.get('/', async (req, res) => {
   const userId = req.user.id;
   const friends = await db.prepare(`
     SELECT u.id, u.username, u.email, u.avatar_color,
-           c.id as checkin_id, c.lat, c.lng, c.location_name, c.note, c.checked_in_at
+      (SELECT checked_in_at FROM checkins WHERE user_id = u.id ORDER BY checked_in_at DESC LIMIT 1) as last_checkin,
+      (SELECT COUNT(*) FROM medals WHERE user_id = u.id) as medal_count
     FROM users u
     JOIN friendships f ON (
       (f.requester_id = ? AND f.addressee_id = u.id) OR
       (f.addressee_id = ? AND f.requester_id = u.id)
-    )
-    LEFT JOIN checkins c ON c.id = (
-      SELECT id FROM checkins WHERE user_id = u.id ORDER BY checked_in_at DESC LIMIT 1
     )
     WHERE f.status = 'accepted'
   `).all(userId, userId);
@@ -593,7 +613,7 @@ checkinsRouter.get('/feed', async (req, res) => {
       WHERE (requester_id = ? OR addressee_id = ?) AND status = 'accepted'
     )
     ORDER BY c.checked_in_at DESC
-    LIMIT 20
+    LIMIT 50
   `).all(userId, userId, userId, userId);
 
   const feed = [];
@@ -636,10 +656,10 @@ checkinsRouter.get('/stats', async (req, res) => {
     return row ? Number(row.cnt) : 0;
   }
   return ok(res, {
-    h24: await count(periodFilter('24h')),
-    week: await count(periodFilter('week')),
-    month: await count(periodFilter('month')),
-    year: await count(periodFilter('year')),
+    today: await count(periodFilter('24h')),
+    this_week: await count(periodFilter('week')),
+    this_month: await count(periodFilter('month')),
+    this_year: await count(periodFilter('year')),
     total: await count(null)
   });
 });
@@ -655,7 +675,7 @@ reactionsRouter.post('/checkins/:id/react', async (req, res) => {
   if (!type || !['coming', 'great', 'custom'].includes(type)) {
     return fail(res, 'type must be coming, great, or custom');
   }
-  const checkin = await db.prepare('SELECT id FROM checkins WHERE id = ?').get(req.params.id);
+  const checkin = await db.prepare('SELECT * FROM checkins WHERE id = ?').get(req.params.id);
   if (!checkin) return fail(res, 'Checkin not found', 404);
 
   let reactionId;
@@ -671,6 +691,39 @@ reactionsRouter.post('/checkins/:id/react', async (req, res) => {
     reactionId = r.lastInsertRowid;
   }
   const reaction = await db.prepare('SELECT * FROM reactions WHERE id = ?').get(reactionId);
+
+  // Send push notification to check-in owner (not to yourself)
+  if (checkin.user_id !== req.user.id) {
+    const reactor = await db.prepare('SELECT username FROM users WHERE id = ?').get(req.user.id);
+    const subscriptions = await db.prepare(
+      'SELECT * FROM push_subscriptions WHERE user_id = ?'
+    ).all(checkin.user_id);
+
+    const notificationTitle = type === 'coming'
+      ? `${reactor.username} komt er ook aan! 🏃`
+      : type === 'great'
+      ? `${reactor.username} reageert: Goed bezig! 💪`
+      : `${reactor.username} reageert${message ? `: ${message}` : ''}`;
+
+    const notificationPayload = JSON.stringify({
+      title: notificationTitle,
+      body: checkin.location_name || 'Je check-in',
+      data: { checkin_id: checkin.id }
+    });
+
+    for (const sub of subscriptions) {
+      try {
+        await webpush.sendNotification(
+          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+          notificationPayload
+        );
+      } catch (err) {
+        console.log('Push failed, removing subscription:', err.message);
+        await db.prepare('DELETE FROM push_subscriptions WHERE id = ?').run(sub.id);
+      }
+    }
+  }
+
   return ok(res, reaction, 201);
 });
 
@@ -705,7 +758,8 @@ rankingsRouter.get('/', async (req, res) => {
   let rows;
   if (since) {
     rows = await db.prepare(`
-      SELECT u.id as user_id, u.username, u.avatar_color, COUNT(c.id) as count
+      SELECT u.id as user_id, u.username, u.avatar_color, COUNT(c.id) as count,
+             (SELECT COUNT(*) FROM medals WHERE user_id = u.id) as medal_count
       FROM users u
       LEFT JOIN checkins c ON c.user_id = u.id AND c.checked_in_at >= ${since}
       WHERE u.id IN (${placeholders})
@@ -713,7 +767,8 @@ rankingsRouter.get('/', async (req, res) => {
     `).all(...groupIds);
   } else {
     rows = await db.prepare(`
-      SELECT u.id as user_id, u.username, u.avatar_color, COUNT(c.id) as count
+      SELECT u.id as user_id, u.username, u.avatar_color, COUNT(c.id) as count,
+             (SELECT COUNT(*) FROM medals WHERE user_id = u.id) as medal_count
       FROM users u
       LEFT JOIN checkins c ON c.user_id = u.id
       WHERE u.id IN (${placeholders})
@@ -935,6 +990,106 @@ app.use('/api/push', pushRouter);
 app.get('/health', (req, res) => {
   return res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN route
+// ═══════════════════════════════════════════════════════════════════════════════
+app.get('/admin', async (req, res) => {
+  if (req.query.key !== 'gymcheck-admin') {
+    return res.status(401).send('<h1>Toegang geweigerd</h1><p>Voeg ?key=gymcheck-admin toe aan de URL</p>');
+  }
+  
+  const users = await db.prepare(`
+    SELECT u.id, u.username, u.email, u.created_at,
+           COUNT(c.id) as checkin_count
+    FROM users u
+    LEFT JOIN checkins c ON c.user_id = u.id
+    GROUP BY u.id, u.username, u.email, u.created_at
+    ORDER BY u.created_at DESC
+  `).all();
+  
+  const recentCheckins = await db.prepare(`
+    SELECT c.id, u.username, c.location_name, c.checked_in_at
+    FROM checkins c
+    JOIN users u ON u.id = c.user_id
+    ORDER BY c.checked_in_at DESC
+    LIMIT 50
+  `).all();
+  
+  const friendCount = await db.prepare(
+    "SELECT COUNT(*) as cnt FROM friendships WHERE status = 'accepted'"
+  ).get();
+  
+  const html = `<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GymCheck Admin</title>
+  <style>
+    body { font-family: system-ui; background: #0f172a; color: #e2e8f0; padding: 20px; max-width: 900px; margin: 0 auto; }
+    h1 { color: #22c55e; }
+    h2 { color: #94a3b8; font-size: 14px; text-transform: uppercase; margin-top: 30px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th { background: #1e293b; padding: 10px; text-align: left; font-size: 12px; color: #94a3b8; }
+    td { padding: 10px; border-bottom: 1px solid #1e293b; font-size: 14px; }
+    tr:hover td { background: #1e293b; }
+    .badge { background: #22c55e; color: #0f172a; padding: 2px 8px; border-radius: 20px; font-size: 12px; font-weight: bold; }
+    .stats { display: flex; gap: 20px; margin: 20px 0; }
+    .stat { background: #1e293b; padding: 20px; border-radius: 12px; flex: 1; text-align: center; }
+    .stat-value { font-size: 32px; font-weight: bold; color: #22c55e; }
+    .stat-label { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+  </style>
+</head>
+<body>
+  <h1>🏋️ GymCheck Admin</h1>
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-value">${users.length}</div>
+      <div class="stat-label">Gebruikers</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">${users.reduce((s, u) => s + Number(u.checkin_count || 0), 0)}</div>
+      <div class="stat-label">Check-ins totaal</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value">${Number(friendCount?.cnt || 0)}</div>
+      <div class="stat-label">Vriendschappen</div>
+    </div>
+  </div>
+  
+  <h2>👥 Gebruikers (${users.length})</h2>
+  <table>
+    <tr><th>Gebruikersnaam</th><th>Email</th><th>Check-ins</th><th>Aangemeld op</th></tr>
+    ${users.map(u => `
+      <tr>
+        <td><strong>${u.username}</strong></td>
+        <td>${u.email}</td>
+        <td><span class="badge">${u.checkin_count || 0}</span></td>
+        <td>${new Date(u.created_at).toLocaleString('nl-NL')}</td>
+      </tr>
+    `).join('')}
+  </table>
+  
+  <h2>📍 Recente check-ins</h2>
+  <table>
+    <tr><th>Gebruiker</th><th>Locatie</th><th>Wanneer</th></tr>
+    ${recentCheckins.map(c => `
+      <tr>
+        <td><strong>${c.username}</strong></td>
+        <td>${c.location_name || 'Onbekend'}</td>
+        <td>${new Date(c.checked_in_at).toLocaleString('nl-NL')}</td>
+      </tr>
+    `).join('')}
+  </table>
+  
+  <p style="color:#475569; margin-top:40px; font-size:12px">Pagina geladen op ${new Date().toLocaleString('nl-NL')}</p>
+</body>
+</html>`;
+  
+  res.send(html);
+});
+
 
 // ─── Serve Frontend ──────────────────────────────────────────────────────────
 const frontendDist = path.join(__dirname, 'frontend', 'dist');

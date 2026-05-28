@@ -506,10 +506,13 @@ function RankingsTab({ user }) {
                   {r.username}
                   {r.user_id === user?.id && <span style={{fontSize:11, marginLeft:6, color:'var(--accent)'}}>● jij</span>}
                 </div>
-                {r.medal_count > 0 && <div className="rank-sub"><Medals count={r.medal_count} /></div>}
+                <div className="rank-sub">
+                  {r.count} check-ins
+                  {r.medal_count > 0 && <span style={{marginLeft:6}}><Medals count={r.medal_count} /></span>}
+                </div>
               </div>
               <div className="rank-count">
-                <div className="rank-count-num">{r.checkin_count}</div>
+                <div className="rank-count-num">{r.count}</div>
                 <div className="rank-count-label">check-ins</div>
               </div>
             </div>
@@ -534,9 +537,10 @@ function RankingsTab({ user }) {
                       <Avatar name={r.username} size="sm" />
                       <div className="rank-info">
                         <div className="rank-name">{r.username}</div>
+                        <div className="rank-sub">{r.count} check-ins</div>
                       </div>
                       <div className="rank-count">
-                        <div className="rank-count-num">{r.checkin_count}</div>
+                        <div className="rank-count-num">{r.count}</div>
                         <div className="rank-count-label">check-ins</div>
                       </div>
                     </div>
@@ -775,9 +779,16 @@ function SocialTab({ user }) {
                 <div className="user-info">
                   <div className="user-name">
                     {f.username}
-                    {getMedalCount(f.username) > 0 && <span style={{marginLeft:6}}><Medals count={getMedalCount(f.username)} /></span>}
+                    {(f.medal_count > 0 || getMedalCount(f.username) > 0) && <span style={{marginLeft:6}}><Medals count={f.medal_count || getMedalCount(f.username)} /></span>}
                   </div>
-                  <div className="user-sub">{f.email}</div>
+                  <div className="user-sub">
+                    {f.last_checkin
+                      ? (() => {
+                          const days = Math.floor((Date.now() - new Date(f.last_checkin).getTime()) / 86400000);
+                          return days === 0 ? '✅ Vandaag ingecheckt' : days === 1 ? '📅 Gisteren ingecheckt' : `📅 Laatst: ${days} dagen geleden`;
+                        })()
+                      : 'Nog niet ingecheckt'}
+                  </div>
                 </div>
                 <button className="btn btn-ghost btn-xs" onClick={() => removeFriend(f.friendship_id || f.id)}>✕</button>
               </div>
@@ -902,7 +913,7 @@ export default function App() {
       )}
       {tab === 'stats' && <StatsTab />}
       {tab === 'rankings' && <RankingsTab user={user} />}
-      {tab === 'social' && <SocialTab user={user} />}
+      {tab === 'vrienden' && <SocialTab user={user} />}
 
       <nav className="bottom-nav">
         <button className={`nav-btn ${tab==='home'?'active':''}`} onClick={() => setTab('home')}>
@@ -917,9 +928,9 @@ export default function App() {
           <span className="icon">🏆</span>
           <span>Ranking</span>
         </button>
-        <button className={`nav-btn ${tab==='social'?'active':''}`} onClick={() => setTab('social')}>
+        <button className={`nav-btn ${tab==='vrienden'?'active':''}`} onClick={() => setTab('vrienden')}>
           <span className="icon">👥</span>
-          <span>Sociaal</span>
+          <span>Vrienden</span>
         </button>
       </nav>
     </>
