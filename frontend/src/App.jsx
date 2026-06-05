@@ -145,10 +145,14 @@ function RegisterScreen({ onLogin, onSwitch }) {
 
 // ── Check-in Modal ───────────────────────────────────────────────────────────
 function CheckInModal({ onClose, onSuccess }) {
-  const [step, setStep] = useState('locating'); // locating | confirm | posting
+  const [step, setStep] = useState('locating'); // locating | picking | confirm | posting
   const [coords, setCoords] = useState(null);
   const [locErr, setLocErr] = useState('');
-  const [form, setForm] = useState({ location_name: '', note: '' });
+  const [nearbyPlaces, setNearbyPlaces] = useState([]);
+  const [selectedPlace, setSelectedPlace] = useState('');
+  const [customName, setCustomName] = useState('');
+  const [loadingPlaces, setLoadingPlaces] = useState(false);
+  const [form, setForm] = useState({ note: '' });
   const [err, setErr] = useState('');
 
   useEffect(() => {
@@ -158,56 +162,183 @@ function CheckInModal({ onClose, onSuccess }) {
       return;
     }
     navigator.geolocation.getCurrentPosition(
-      pos => {
-        setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
-        setForm(f => ({ ...f, location_name: 'Mijn sportschool' }));
-        setStep('confirm');
+      async pos => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        setCoords({ lat, lng });
+        setStep('picking');
+        setLoadingPlaces(true);
+        
+        // Query OpenStreetMap Overpass API for nearby gyms
+        try {
+          const radius = 1500; // 1.5km radius
+          const query = `
+            [out:json][timeout:10];
+            (
+              node["leisure"="fitness_centre"](around:${radius},${lat},${lng});
+              node["amenity"="gym"](around:${radius},${lat},${lng});
+              node["sport"="fitness"](around:${radius},${lat},${lng});
+              way["leisure"="fitness_centre"](around:${radius},${lat},${lng});
+              way["amenity"="gym"](around:${radius},${lat},${lng});
+            );
+            out center;
+          `;
+          
+          const response = await fetch('https://overpass-api.de/api/interpreter', {
+            method: 'POST',
+            body: query,
+          });
+          
+          const data = await response.json();
+          
+          // Extract places with names, sort by distance
+          const places = data.elements
+            .filter(el => el.tags && el.tags.name)
+            .map(el => {
+              const elLat = el.lat || el.center?.lat;
+              const elLng = el.lon || el.center?.lon;
+              const dist = elLat && elLng 
+                ? Math.round(Math.sqrt(
+                    Math.pow((elLat - lat) * 111000, 2) + 
+                    Math.pow((elLng - lng) * 111000 * Math.cos(lat * Math.PI/180), 2)
+                  ))
+                : 9999;
+              return {
+                id: el.id,
+                name: el.tags.name,
+                brand: el.tags.brand || el.tags['brand:nl'] || '',
+                distance: dist,
+              };
+            })
+            .sort((a, b) => a.distance - b.distance)
+            .slice(0, 8); // Max 8 suggestions
+          
+          setNearbyPlaces(places);
+        } catch (e) {
+          console.error('Could not load nearby places:', e);
+          // Silently fail — user can still type a name
+        } finally {
+          setLoadingPlaces(false);
+        }
       },
       () => {
         setLocErr('Locatie niet beschikbaar');
         setStep('confirm');
       },
-      { timeout: 8000 }
+      { timeout: 10000, enableHighAccuracy: true }
     );
   }, []);
 
+  const locationName = selectedPlace || customName;
+
   async function handleSubmit() {
-    if (!form.location_name.trim()) { setErr('Vul een locatienaam in'); return; }
-    setErr(''); setStep('posting');
+    if (!locationName.trim()) { setErr('Kies een locatie of typ een naam'); return; }
+    setErr('');
+    setStep('posting');
     try {
       await post('/api/checkins', {
         lat: coords?.lat || null,
         lng: coords?.lng || null,
-        location_name: form.location_name,
+        location_name: locationName.trim(),
         note: form.note,
       });
       onSuccess();
-    } catch (e) { setErr(e.message); setStep('confirm'); }
+    } catch (e) { setErr(e.message); setStep(coords ? 'picking' : 'confirm'); }
   }
 
   return (
     <div className="modal-overlay" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="modal">
         <div className="modal-title">💪 Check In</div>
+        
         {step === 'locating' && (
           <div className="loading">📍 Locatie bepalen...</div>
         )}
-        {(step === 'confirm' || step === 'posting') && (
+        
+        {(step === 'picking' || step === 'confirm' || step === 'posting') && (
           <>
-            {locErr && <div style={{fontSize:12,color:'var(--muted)',marginBottom:12}}>⚠️ {locErr}</div>}
-            {coords && <div className="success-msg" style={{marginBottom:12}}>📍 GPS: {coords.lat.toFixed(4)}, {coords.lng.toFixed(4)}</div>}
+            {locErr && <div style={{fontSize:12, color:'var(--muted)', marginBottom:12}}>⚠️ {locErr}</div>}
+            
+            {/* Nearby places */}
+            {loadingPlaces && (
+              <div style={{fontSize:13, color:'var(--muted)', marginBottom:12}}>🔍 Sportscholen in de buurt zoeken...</div>
+            )}
+            
+            {!loadingPlaces && nearbyPlaces.length > 0 && (
+              <div style={{marginBottom:16}}>
+                <div style={{fontSize:12, color:'var(--muted)', marginBottom:8, fontWeight:600, textTransform:'uppercase', letterSpacing:1}}>
+                  📍 Sportscholen in de buurt
+                </div>
+                <div style={{display:'flex', flexDirection:'column', gap:8}}>
+                  {nearbyPlaces.map(place => (
+                    <button
+                      key={place.id}
+                      onClick={() => { setSelectedPlace(place.name); setCustomName(''); }}
+                      style={{
+                        background: selectedPlace === place.name ? 'var(--accent)' : 'var(--card)',
+                        color: selectedPlace === place.name ? '#0f172a' : 'white',
+                        border: selectedPlace === place.name ? 'none' : '1px solid #334155',
+                        borderRadius: 10,
+                        padding: '10px 14px',
+                        textAlign: 'left',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                      }}
+                    >
+                      <div>
+                        <div style={{fontWeight:600, fontSize:14}}>{place.name}</div>
+                      </div>
+                      <div style={{fontSize:12, opacity:0.7}}>{place.distance < 1000 ? `${place.distance}m` : `${(place.distance/1000).toFixed(1)}km`}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            
+            {/* Custom name input */}
             <div className="form-group">
-              <label className="label">Locatie naam *</label>
-              <input className="input" type="text" placeholder="bijv. Basic-Fit Amsterdam" value={form.location_name} onChange={e => setForm(f => ({...f, location_name: e.target.value}))} />
+              <label className="label">
+                {nearbyPlaces.length > 0 ? 'Of typ een andere naam' : 'Locatie naam *'}
+              </label>
+              <input
+                className="input"
+                type="text"
+                placeholder="bijv. Basic-Fit Hoofddorp"
+                value={customName}
+                onChange={e => { setCustomName(e.target.value); setSelectedPlace(''); }}
+              />
             </div>
+            
+            {/* Note */}
             <div className="form-group">
               <label className="label">Notitie (optioneel)</label>
-              <textarea className="input" placeholder="bijv. Leg day vandaag! 🦵" value={form.note} onChange={e => setForm(f => ({...f, note: e.target.value}))} rows={3} />
+              <textarea
+                className="input"
+                placeholder="bijv. Leg day vandaag! 🦵"
+                value={form.note}
+                onChange={e => setForm(f => ({...f, note: e.target.value}))}
+                rows={2}
+              />
             </div>
+            
+            {/* Selected location preview */}
+            {locationName && (
+              <div style={{background:'#0f2d1a', border:'1px solid var(--accent)', borderRadius:8, padding:'8px 12px', marginBottom:12, fontSize:13, color:'#86efac'}}>
+                ✓ Inchecklocatie: <strong>{locationName}</strong>
+              </div>
+            )}
+            
             {err && <div className="error-msg">{err}</div>}
+            
             <div className="modal-actions">
               <button className="btn btn-secondary" onClick={onClose}>Annuleren</button>
-              <button className="btn btn-primary" onClick={handleSubmit} disabled={step === 'posting'}>
+              <button
+                className="btn btn-primary"
+                onClick={handleSubmit}
+                disabled={step === 'posting' || !locationName.trim()}
+              >
                 {step === 'posting' ? 'Bezig...' : '✓ Check In!'}
               </button>
             </div>
@@ -261,10 +392,13 @@ function HomeTab({ user, onCheckinSuccess, locationPermission, onLocationPermiss
   const [customMsg, setCustomMsg] = useState({});
   const [showCustom, setShowCustom] = useState({});
 
+  const [err, setErr] = useState('');
+
   const loadFeed = useCallback(async () => {
     setLoading(true);
+    setErr('');
     try { setFeed(await get('/api/checkins/feed')); }
-    catch (e) { console.error(e); }
+    catch (e) { console.error(e); setErr(e.message); }
     finally { setLoading(false); }
   }, []);
 
@@ -322,6 +456,8 @@ function HomeTab({ user, onCheckinSuccess, locationPermission, onLocationPermiss
           {checkinMsg}
         </div>
       )}
+
+      {err && <div className="error-banner">Feed kon niet geladen worden: {err}</div>}
 
       <div style={{display:'flex', alignItems:'center', justifyContent:'space-between', margin:'16px 0 10px'}}>
         <div style={{fontSize:15, fontWeight:700}}>🏃 Vrienden feed</div>
@@ -385,66 +521,79 @@ function HomeTab({ user, onCheckinSuccess, locationPermission, onLocationPermiss
   );
 }
 
-// ── Stats Tab ────────────────────────────────────────────────────────────────
-function StatsTab() {
-  const [stats, setStats] = useState(null);
-  const [mine, setMine] = useState([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    Promise.all([get('/api/checkins/stats'), get('/api/checkins/mine')])
-      .then(([s, m]) => { setStats(s); setMine(m); })
-      .catch(console.error)
-      .finally(() => setLoading(false));
-  }, []);
-
-  if (loading) return <div className="page"><div className="loading">Laden...</div></div>;
-
+// ── Spelregels Tab ───────────────────────────────────────────────────────────
+function SpelregelsTab() {
   return (
     <div className="page">
-      <div style={{fontSize:18, fontWeight:800, marginBottom:16}}>📊 Mijn statistieken</div>
-      {stats && (
-        <div className="stats-grid">
-          <div className="stat-card">
-            <div className="stat-value">{stats.today || 0}</div>
-            <div className="stat-label">Vandaag</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-value">{stats.this_week || 0}</div>
-            <div className="stat-label">Deze week</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-value">{stats.this_month || 0}</div>
-            <div className="stat-label">Deze maand</div>
-          </div>
-          <div className="stat-card">
-            <div className="stat-value">{stats.this_year || 0}</div>
-            <div className="stat-label">Dit jaar</div>
-          </div>
-          <div className="stat-card stat-total">
-            <div className="stat-value" style={{fontSize:40}}>{stats.total || 0}</div>
-            <div className="stat-label">Totaal check-ins 🏋️</div>
-          </div>
-        </div>
-      )}
+      <div style={{fontSize:18, fontWeight:800, marginBottom:8}}>📋 Spelregels</div>
+      <div style={{fontSize:13, color:'var(--muted)', marginBottom:20}}>Hoe werkt GymCheck?</div>
+      
+      <div className="card" style={{marginBottom:16, padding:20}}>
+        <div style={{fontSize:15, fontWeight:700, marginBottom:12, color:'var(--accent)'}}>🏋️ Hoe werkt het?</div>
+        <p style={{fontSize:14, color:'#cbd5e1', lineHeight:1.7, margin:0}}>
+          Deze app houdt bij hoe vaak jij naar de sportschool bent gegaan. Net als bij Beer with Me wordt er van je verwacht dat je netjes incheckt als je op de sportschool aankomt. Dit is tevens een signaal naar je gym-buddies dat ze ook moeten komen.
+        </p>
+      </div>
 
-      <div style={{fontSize:16, fontWeight:700, marginBottom:10}}>🗓️ Recente check-ins</div>
-      {mine.length === 0 && (
-        <div className="empty-state">
-          <div className="empty-icon">🏋️</div>
-          <div className="empty-text">Nog geen check-ins. Ga naar de sportschool!</div>
-        </div>
-      )}
-      {mine.map(c => (
-        <div className="card card-sm" key={c.id} style={{display:'flex', alignItems:'center', gap:12}}>
-          <div style={{fontSize:24}}>✅</div>
-          <div style={{flex:1}}>
-            <div style={{fontWeight:600, fontSize:14}}>📍 {c.location_name || 'Onbekend'}</div>
-            {c.note && <div style={{fontSize:12, color:'var(--muted)', fontStyle:'italic'}}>{c.note}</div>}
-            <div style={{fontSize:11, color:'var(--muted)', marginTop:2}}>{timeAgo(c.checked_in_at)}</div>
+      <div className="card" style={{padding:20}}>
+        <div style={{fontSize:15, fontWeight:700, marginBottom:16, color:'var(--accent)'}}>📌 De regels</div>
+        
+        <div style={{display:'flex', flexDirection:'column', gap:16}}>
+          <div style={{display:'flex', gap:14, alignItems:'flex-start'}}>
+            <div style={{background:'var(--accent)', color:'#0f172a', width:28, height:28, borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center', fontWeight:800, fontSize:13, flexShrink:0}}>1</div>
+            <div>
+              <div style={{fontWeight:600, fontSize:14, marginBottom:2}}>Maximaal 1 check-in per dag</div>
+              <div style={{fontSize:13, color:'var(--muted)'}}>Je kunt elke dag één keer inchecken op de sportschool.</div>
+            </div>
+          </div>
+
+          <div style={{display:'flex', gap:14, alignItems:'flex-start'}}>
+            <div style={{background:'var(--accent)', color:'#0f172a', width:28, height:28, borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center', fontWeight:800, fontSize:13, flexShrink:0}}>2</div>
+            <div>
+              <div style={{fontWeight:600, fontSize:14, marginBottom:2}}>Check-ins worden bijgehouden</div>
+              <div style={{fontSize:13, color:'var(--muted)'}}>Je score wordt bijgehouden per dag, week, maand en jaar.</div>
+            </div>
+          </div>
+
+          <div style={{display:'flex', gap:14, alignItems:'flex-start'}}>
+            <div style={{background:'var(--accent)', color:'#0f172a', width:28, height:28, borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center', fontWeight:800, fontSize:13, flexShrink:0}}>3</div>
+            <div>
+              <div style={{fontWeight:600, fontSize:14, marginBottom:2}}>Een week = maandag t/m zondag</div>
+              <div style={{fontSize:13, color:'var(--muted)'}}>Maximaal 7 check-ins per week mogelijk.</div>
+            </div>
+          </div>
+
+          <div style={{display:'flex', gap:14, alignItems:'flex-start'}}>
+            <div style={{background:'#f59e0b', color:'#0f172a', width:28, height:28, borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center', fontWeight:800, fontSize:13, flexShrink:0}}>4</div>
+            <div>
+              <div style={{fontWeight:600, fontSize:14, marginBottom:2}}>🥇 Weekmedaille</div>
+              <div style={{fontSize:13, color:'var(--muted)'}}>Degene met de meeste check-ins in een week krijgt een medaille. Bij gelijkspel krijgen alle winnaars een medaille.</div>
+            </div>
+          </div>
+
+          <div style={{display:'flex', gap:14, alignItems:'flex-start'}}>
+            <div style={{background:'#f59e0b', color:'#0f172a', width:28, height:28, borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center', fontWeight:800, fontSize:13, flexShrink:0}}>5</div>
+            <div>
+              <div style={{fontWeight:600, fontSize:14, marginBottom:2}}>🏆 Maandwinnaar</div>
+              <div style={{fontSize:13, color:'var(--muted)'}}>Degene met de meeste weekmedailles in een maand wint de maand.</div>
+            </div>
+          </div>
+
+          <div style={{display:'flex', gap:14, alignItems:'flex-start'}}>
+            <div style={{background:'#f59e0b', color:'#0f172a', width:28, height:28, borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center', fontWeight:800, fontSize:13, flexShrink:0}}>6</div>
+            <div>
+              <div style={{fontWeight:600, fontSize:14, marginBottom:2}}>🎖️ Jaarwinnaar</div>
+              <div style={{fontSize:13, color:'var(--muted)'}}>Degene met de meeste weekmedailles in een jaar wint het jaar.</div>
+            </div>
           </div>
         </div>
-      ))}
+      </div>
+
+      <div className="card" style={{marginTop:16, padding:16, background:'#0f2d1a', border:'1px solid var(--accent)'}}>
+        <div style={{fontSize:13, color:'#86efac', lineHeight:1.6}}>
+          💡 <strong>Tip:</strong> Zorg dat je push-notificaties hebt ingeschakeld, zodat je een melding krijgt als een vriend incheckt of reageert op jouw check-in!
+        </div>
+      </div>
     </div>
   );
 }
@@ -457,16 +606,18 @@ function RankingsTab({ user }) {
   const [groupRankings, setGroupRankings] = useState({});
   const [loading, setLoading] = useState(true);
   const [activeGroup, setActiveGroup] = useState(null);
+  const [err, setErr] = useState('');
 
   useEffect(() => {
     setLoading(true);
+    setErr('');
     Promise.all([
       get(`/api/rankings?period=${period}`),
       get('/api/groups'),
     ]).then(([r, g]) => {
       setRankings(r);
       setGroups(g);
-    }).catch(console.error).finally(() => setLoading(false));
+    }).catch(e => { console.error(e); setErr(e.message); }).finally(() => setLoading(false));
   }, [period]);
 
   async function loadGroupRanking(groupId) {
@@ -493,6 +644,7 @@ function RankingsTab({ user }) {
         ))}
       </div>
 
+      {err && <div className="error-banner">Ranglijst kon niet geladen worden: {err}</div>}
       <div style={{fontSize:15, fontWeight:700, marginBottom:10}}>👥 Vrienden ranglijst</div>
       {loading ? <div className="loading">Laden...</div> : (
         <div className="card">
@@ -911,7 +1063,7 @@ export default function App() {
           onLocationPermissionChange={setLocationPermission}
         />
       )}
-      {tab === 'stats' && <StatsTab />}
+      {tab === 'spelregels' && <SpelregelsTab />}
       {tab === 'rankings' && <RankingsTab user={user} />}
       {tab === 'vrienden' && <SocialTab user={user} />}
 
@@ -920,9 +1072,9 @@ export default function App() {
           <span className="icon">🏠</span>
           <span>Home</span>
         </button>
-        <button className={`nav-btn ${tab==='stats'?'active':''}`} onClick={() => setTab('stats')}>
-          <span className="icon">📊</span>
-          <span>Stats</span>
+        <button className={`nav-btn ${tab==='spelregels'?'active':''}`} onClick={() => setTab('spelregels')}>
+          <span className="icon">📋</span>
+          <span>Spelregels</span>
         </button>
         <button className={`nav-btn ${tab==='rankings'?'active':''}`} onClick={() => setTab('rankings')}>
           <span className="icon">🏆</span>
