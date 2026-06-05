@@ -326,3 +326,13 @@ textarea.input { resize: vertical; min-height: 80px; }
   cursor: pointer;
   width: fit-content;
 }
+
+.error-banner {
+  background: #450a0a;
+  border: 1px solid #ef4444;
+  color: #fca5a5;
+  padding: 12px;
+  border-radius: 8px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}

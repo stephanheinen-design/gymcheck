@@ -32,14 +32,18 @@ webpush.setVapidDetails(
 let db;
 let isPostgres = false;
 
-if (process.env.DATABASE_URL) {
-  // PostgreSQL mode (Render production)
-  isPostgres = true;
+// ─── PostgreSQL pool factory (lazy, so we can fall back to SQLite) ───────────
+async function trySetupPostgres() {
   const { Pool } = require('pg');
   const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+    connectionTimeoutMillis: 5000,
+    idleTimeoutMillis: 10000
   });
+
+  // Test the connection before committing to PostgreSQL mode
+  await pool.query('SELECT 1');
 
   // Convert ? placeholders to $1, $2, etc.
   function pgQuery(sql, params = []) {
@@ -48,7 +52,7 @@ if (process.env.DATABASE_URL) {
     return pool.query(pgSql, params);
   }
 
-  db = {
+  return {
     prepare: (sql) => ({
       get: async (...params) => {
         const flat = params.flat();
@@ -73,14 +77,12 @@ if (process.env.DATABASE_URL) {
       }
     }
   };
+}
 
-  console.log('Using PostgreSQL database');
-} else {
-  // SQLite mode (local development)
+function setupSqlite() {
   const Database = require('better-sqlite3');
   const sqliteDb = new Database(process.env.DB_PATH || '/tmp/gymcheck.db');
-
-  db = {
+  return {
     prepare: (sql) => ({
       get: (...params) => sqliteDb.prepare(sql).get(...params),
       all: (...params) => sqliteDb.prepare(sql).all(...params),
@@ -88,8 +90,32 @@ if (process.env.DATABASE_URL) {
     }),
     exec: (sql) => sqliteDb.exec(sql)
   };
+}
 
-  console.log('Using SQLite database:', process.env.DB_PATH || '/tmp/gymcheck.db');
+// setupDatabase: async – must be called before routes are used
+async function setupDatabase() {
+  if (process.env.DATABASE_URL) {
+    // Attempt PostgreSQL; fall back to SQLite on any connection error
+    try {
+      db = await trySetupPostgres();
+      isPostgres = true;
+      console.log('Using PostgreSQL database');
+    } catch (pgErr) {
+      console.error('PostgreSQL connection failed:', pgErr.message);
+      console.error('DATABASE_URL is set but the database is not reachable.');
+      console.error('Possible causes:');
+      console.error('  1. DATABASE_URL environment variable is incorrect');
+      console.error('  2. PostgreSQL service is still starting up');
+      console.error('  3. SSL/network configuration mismatch');
+      console.error('Falling back to SQLite for this session.');
+      isPostgres = false;
+      db = setupSqlite();
+      console.log('Using SQLite database (fallback):', process.env.DB_PATH || '/tmp/gymcheck.db');
+    }
+  } else {
+    db = setupSqlite();
+    console.log('Using SQLite database:', process.env.DB_PATH || '/tmp/gymcheck.db');
+  }
 }
 
 // ─── Schema ───────────────────────────────────────────────────────────────────
@@ -239,12 +265,45 @@ const sqliteSchema = `
   );
 `;
 
-// Initialize schema (async-safe)
+// ─── Database Schema Initialization (with retry + no crash on failure) ────────
+async function initializeDatabase(retries = 5) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      await db.exec(isPostgres ? pgSchema : sqliteSchema);
+      console.log('Database tables initialized successfully');
+      return;
+    } catch (err) {
+      console.error(`Database init attempt ${attempt}/${retries} failed:`, err.message);
+      if (attempt === retries) {
+        console.error('WARNING: Could not initialize database schema after', retries, 'attempts.');
+        console.error('The app will continue; schema will be retried on the next restart.');
+        return; // Don't crash — let the process stay alive
+      }
+      const wait = Math.min(1000 * Math.pow(2, attempt - 1), 10000); // 1s, 2s, 4s, 8s, 10s
+      console.log(`Retrying database init in ${wait}ms...`);
+      await new Promise(resolve => setTimeout(resolve, wait));
+    }
+  }
+}
+
+// ─── Bootstrap (async startup) ────────────────────────────────────────────────
+// All async setup (DB connection + schema init) happens here, then the server
+// starts. This avoids top-level await (not supported in CJS modules).
 (async () => {
-  await db.exec(isPostgres ? pgSchema : sqliteSchema);
-  console.log('Database tables initialized');
+  // 1. Set up the database connection (with PostgreSQL → SQLite fallback)
+  await setupDatabase();
+
+  // 2. Initialize schema with retry logic (non-fatal on failure)
+  await initializeDatabase();
+
+  // 3. Start the HTTP server
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`GymCheck API listening on port ${PORT}`);
+    console.log(`Frontend dist: ${frontendDist}`);
+    console.log(`Frontend exists: ${fs.existsSync(frontendDist)}`);
+  });
 })().catch(err => {
-  console.error('Failed to initialize database schema:', err);
+  console.error('Fatal startup error:', err);
   process.exit(1);
 });
 
@@ -1105,13 +1164,6 @@ app.use((req, res) => fail(res, 'Not found', 404));
 app.use((err, req, res, _next) => {
   console.error(err);
   return fail(res, err.message || 'Internal server error', 500);
-});
-
-// ─── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`GymCheck API listening on port ${PORT}`);
-  console.log(`Frontend dist: ${frontendDist}`);
-  console.log(`Frontend exists: ${fs.existsSync(frontendDist)}`);
 });
 
 module.exports = app;
