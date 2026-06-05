@@ -403,18 +403,27 @@ async function sendPushToFriends(userId, payload) {
 }
 
 // ─── Medal Logic ──────────────────────────────────────────────────────────────
-async function tryAwardMedal(userId) {
-  // Compute ISO week label (Monday = start of week)
+async function tryAwardPreviousWeekMedal(userId) {
   const now = new Date();
   const day = now.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
-  // Start of this ISO week (Monday)
-  const startOfWeek = new Date(now);
-  startOfWeek.setDate(now.getDate() - (day === 0 ? 6 : day - 1));
-  startOfWeek.setHours(0, 0, 0, 0);
-  const startOfWeekISO = startOfWeek.toISOString();
-
-  // ISO week label e.g. "2025-W22"
-  const weekLabel = isoWeekLabel(now);
+  
+  // Only award medals on Monday (week is complete)
+  if (day !== 1) return;
+  
+  // Start of last week = 7 days ago (Monday)
+  const startOfLastWeek = new Date(now);
+  startOfLastWeek.setDate(now.getDate() - 7);
+  startOfLastWeek.setHours(0, 0, 0, 0);
+  const startOfLastWeekISO = startOfLastWeek.toISOString();
+  
+  // End of last week = yesterday (Sunday) 23:59:59
+  const endOfLastWeek = new Date(now);
+  endOfLastWeek.setDate(now.getDate() - 1);
+  endOfLastWeek.setHours(23, 59, 59, 999);
+  const endOfLastWeekISO = endOfLastWeek.toISOString();
+  
+  // Week label for the previous week
+  const weekLabel = isoWeekLabel(startOfLastWeek);
 
   // Get all friends
   const friendRows = await db.prepare(`
@@ -424,7 +433,7 @@ async function tryAwardMedal(userId) {
   const allUserIds = [userId, ...friendRows.map(r => r.friend_id)];
   const placeholders = allUserIds.map(() => '?').join(',');
 
-  // Count check-ins since Monday for all users in the group
+  // Count check-ins from last week for all users in the group
   let countSql;
   if (isPostgres) {
     countSql = `
@@ -432,6 +441,7 @@ async function tryAwardMedal(userId) {
       FROM checkins
       WHERE user_id IN (${placeholders})
         AND checked_in_at >= ?
+        AND checked_in_at <= ?
       GROUP BY user_id
       ORDER BY count DESC
     `;
@@ -441,11 +451,12 @@ async function tryAwardMedal(userId) {
       FROM checkins
       WHERE user_id IN (${placeholders})
         AND checked_in_at >= ?
+        AND checked_in_at <= ?
       GROUP BY user_id
       ORDER BY count DESC
     `;
   }
-  const counts = await db.prepare(countSql).all(...allUserIds, startOfWeekISO);
+  const counts = await db.prepare(countSql).all(...allUserIds, startOfLastWeekISO, endOfLastWeekISO);
 
   if (counts.length === 0) return;
 
@@ -467,6 +478,7 @@ async function tryAwardMedal(userId) {
     }
   }
 }
+
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 const app = express();
@@ -656,7 +668,7 @@ checkinsRouter.post('/', async (req, res) => {
   }
   const checkin = await db.prepare('SELECT * FROM checkins WHERE id = ?').get(checkinId);
 
-  tryAwardMedal(userId).catch(console.error);
+  tryAwardPreviousWeekMedal(userId).catch(console.error);
 
   sendPushToFriends(userId, {
     title: `${req.user.username} is aan het sporten!`,
