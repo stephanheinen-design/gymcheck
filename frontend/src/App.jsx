@@ -989,6 +989,126 @@ function SocialTab({ user }) {
   );
 }
 
+
+// ── PWA: Module-level helpers ─────────────────────────────────────────────────
+
+// Helper: convert VAPID key from base64url to Uint8Array
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
+}
+
+// Helper: send push subscription to backend
+async function sendSubscriptionToServer(subscription) {
+  const token = getToken();
+  if (!token) return;
+  try {
+    const sub = subscription.toJSON();
+    await post('/api/push/subscribe', {
+      endpoint: sub.endpoint,
+      keys: { p256dh: sub.keys.p256dh, auth: sub.keys.auth },
+    });
+  } catch (err) {
+    console.error('Failed to save push subscription:', err);
+  }
+}
+
+// ── PWA Install Banner ────────────────────────────────────────────────────────
+function InstallBanner() {
+  const [deferredPrompt, setDeferredPrompt] = useState(null);
+  const [showIOSHint, setShowIOSHint] = useState(false);
+  const [dismissed, setDismissed] = useState(() =>
+    localStorage.getItem('gymcheck_install_dismissed') === '1'
+  );
+
+  useEffect(() => {
+    // Android: catch beforeinstallprompt
+    const handler = e => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+    };
+    window.addEventListener('beforeinstallprompt', handler);
+
+    // iOS: check if NOT already installed
+    const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches;
+    if (isIOS && !isStandalone) {
+      setShowIOSHint(true);
+    }
+
+    return () => window.removeEventListener('beforeinstallprompt', handler);
+  }, []);
+
+  if (dismissed) return null;
+
+  // Already installed as PWA
+  if (window.matchMedia('(display-mode: standalone)').matches) return null;
+
+  const dismiss = () => {
+    setDismissed(true);
+    localStorage.setItem('gymcheck_install_dismissed', '1');
+  };
+
+  if (deferredPrompt) {
+    return (
+      <div style={{
+        position: 'fixed', bottom: 80, left: 12, right: 12, zIndex: 999,
+        background: '#1e293b', border: '1px solid #22c55e', borderRadius: 14,
+        padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 12,
+        boxShadow: '0 4px 20px rgba(0,0,0,0.4)'
+      }}>
+        <div style={{fontSize: 32}}>🏋️</div>
+        <div style={{flex: 1}}>
+          <div style={{fontWeight: 700, fontSize: 14}}>Installeer GymCheck</div>
+          <div style={{fontSize: 12, color: '#94a3b8'}}>Voeg toe aan je beginscherm voor de beste ervaring</div>
+        </div>
+        <div style={{display: 'flex', flexDirection: 'column', gap: 6}}>
+          <button
+            onClick={async () => {
+              deferredPrompt.prompt();
+              const { outcome } = await deferredPrompt.userChoice;
+              if (outcome === 'accepted') setDeferredPrompt(null);
+              dismiss();
+            }}
+            style={{background: '#22c55e', color: '#0f172a', border: 'none', borderRadius: 8, padding: '6px 12px', fontWeight: 700, fontSize: 13, cursor: 'pointer'}}
+          >
+            Installeren
+          </button>
+          <button onClick={dismiss} style={{background: 'none', border: 'none', color: '#64748b', fontSize: 11, cursor: 'pointer'}}>
+            Niet nu
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (showIOSHint) {
+    return (
+      <div style={{
+        position: 'fixed', bottom: 80, left: 12, right: 12, zIndex: 999,
+        background: '#1e293b', border: '1px solid #22c55e', borderRadius: 14,
+        padding: '14px 16px', boxShadow: '0 4px 20px rgba(0,0,0,0.4)'
+      }}>
+        <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start'}}>
+          <div style={{fontWeight: 700, fontSize: 14, marginBottom: 6}}>📲 Installeer GymCheck op iPhone</div>
+          <button onClick={dismiss} style={{background: 'none', border: 'none', color: '#64748b', fontSize: 18, cursor: 'pointer', marginTop: -4}}>×</button>
+        </div>
+        <div style={{fontSize: 13, color: '#94a3b8', lineHeight: 1.5}}>
+          Tik op <strong style={{color: 'white'}}>Delen</strong> (↑) onderin Safari → <strong style={{color: 'white'}}>"Zet op beginscherm"</strong> → dan werken push-notificaties ook op iPhone!
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
+
 // ── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const [authScreen, setAuthScreen] = useState('login');
@@ -1015,6 +1135,58 @@ export default function App() {
       });
     }
   }, []);
+
+  // ── PWA: Service Worker + Push Notifications ──────────────────────────────
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+
+    // Register service worker
+    navigator.serviceWorker.register('/sw.js').then(async reg => {
+      console.log('Service worker registered:', reg.scope);
+
+      // Wait for SW to be ready
+      const swReg = await navigator.serviceWorker.ready;
+
+      // Check push notification support
+      if (!('PushManager' in window)) return;
+
+      // Check current permission
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') return;
+
+      // Check if already subscribed
+      const existing = await swReg.pushManager.getSubscription();
+      if (existing) {
+        // Send existing subscription to server (in case it changed)
+        sendSubscriptionToServer(existing);
+        return;
+      }
+
+      // Get VAPID public key from server
+      try {
+        const { vapidPublicKey } = await get('/api/push/vapid-public-key');
+        if (!vapidPublicKey) return;
+
+        // Convert VAPID key to Uint8Array
+        const applicationServerKey = urlBase64ToUint8Array(vapidPublicKey);
+
+        // Subscribe to push
+        const subscription = await swReg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey,
+        });
+
+        // Send subscription to server
+        await sendSubscriptionToServer(subscription);
+        console.log('Push subscription active');
+      } catch (err) {
+        console.error('Push subscription failed:', err);
+      }
+    }).catch(err => {
+      console.error('Service worker registration failed:', err);
+    });
+  }, [user]); // re-run when user logs in
+
 
   async function loadTotal() {
     try {
@@ -1085,6 +1257,7 @@ export default function App() {
           <span>Vrienden</span>
         </button>
       </nav>
+      <InstallBanner />
     </>
   );
 }
